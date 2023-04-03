@@ -1,0 +1,42 @@
+from transformers import pipeline
+import torch
+# use the GPU if available
+device = 0 if torch.cuda.is_available() else -1
+summarizer = pipeline("summarization", device=device) 
+
+import pandas as pd
+from pyspark.sql.functions import pandas_udf
+
+@pandas_udf('string')
+def summarize_batch_udf(texts: pd.Series) -> pd.Series:
+  pipe = summarizer(texts.to_list(), truncation=True, batch_size=1)
+  summaries = [summary['summary_text'] for summary in pipe]
+  return pd.Series(summaries)
+
+summaries = df.select(df.text, summarize_batch_udf(df.text).alias("summary"))
+
+sample = sample.repartition(32)
+summaries = sample.select(sample.text, summarize_batch_udf(sample.text).alias("summary"))
+
+import mlflow
+
+class SummarizationPipelineModel(mlflow.pyfunc.PythonModel):
+  def load_context(self, context):
+    device = 0 if torch.cuda.is_available() else -1
+    self.pipeline = pipeline("summarization", context.artifacts["pipeline"], device=device)
+    
+  def predict(self, context, model_input): 
+    texts = model_input.iloc[:,0].to_list() # get the first column
+    pipe = self.pipeline(texts, truncation=True, batch_size=8)
+    summaries = [summary['summary_text'] for summary in pipe]
+    return pd.Series(summaries)
+    
+summarizer.save_pretrained("./pipeline")
+with mlflow.start_run() as run:        
+  mlflow.pyfunc.log_model(artifacts={'pipeline': "./pipeline"}, artifact_path="summarization_model", python_model=SummarizationPipelineModel())
+
+
+logged_model_uri = f"runs:/{run.info.run_id}/summarization_model"
+loaded_model = mlflow.pyfunc.spark_udf(spark, model_uri=logged_model_uri, result_type='string')
+summaries = df.select(df.title, df.text, loaded_model(df.text).alias("summary"))
+
